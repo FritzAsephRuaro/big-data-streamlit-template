@@ -16,7 +16,7 @@ import time
 import json
 from datetime import datetime, timedelta
 from kafka import KafkaConsumer
-from kafka.errors import KafkaError, NoBrokersAvailable
+from kafka.errors import KafkaError
 from streamlit_autorefresh import st_autorefresh
 
 # Page configuration
@@ -28,386 +28,578 @@ st.set_page_config(
 )
 
 def setup_sidebar():
-    """
-    STUDENT TODO: Configure sidebar settings and controls
-    Implement any configuration options students might need
-    """
+    """Configure Kafka, historical storage, and dashboard controls."""
     st.sidebar.title("Dashboard Controls")
-    
-    # STUDENT TODO: Add configuration options for data sources
     st.sidebar.subheader("Data Source Configuration")
-    
-    # Placeholder for Kafka configuration
+
     kafka_broker = st.sidebar.text_input(
-        "Kafka Broker", 
+        "Kafka Broker",
         value="localhost:9092",
-        help="STUDENT TODO: Configure your Kafka broker address"
+        help="Kafka broker address. Use localhost:9092 when Streamlit runs on your computer.",
     )
-    
     kafka_topic = st.sidebar.text_input(
-        "Kafka Topic", 
+        "Kafka Topic",
         value="streaming-data",
-        help="STUDENT TODO: Specify the Kafka topic to consume from"
+        help="Kafka topic containing weather records.",
     )
-    
-    # Placeholder for storage configuration
+
     st.sidebar.subheader("Storage Configuration")
     storage_type = st.sidebar.selectbox(
         "Storage Type",
-        ["HDFS", "MongoDB"],
-        help="STUDENT TODO: Choose your historical data storage solution"
+        ["MongoDB", "HDFS"],
+        index=0,
+        help="Historical weather records are currently queried from MongoDB.",
     )
-    
+
     return {
-        "kafka_broker": kafka_broker,
-        "kafka_topic": kafka_topic,
-        "storage_type": storage_type
+        "kafka_broker": kafka_broker.strip(),
+        "kafka_topic": kafka_topic.strip(),
+        "storage_type": storage_type,
     }
 
 def generate_sample_data():
+    """Return an empty, correctly structured frame when no live records exist.
+
+    The dashboard intentionally avoids fabricated sample readings so charts
+    represent actual data from Kafka or MongoDB only.
     """
-    STUDENT TODO: Replace this with actual data processing
-    
-    This function generates sample data for demonstration purposes.
-    Students should replace this with real data from Kafka and storage systems.
-    """
-    # Sample data for demonstration - REPLACE WITH REAL DATA
-    current_time = datetime.now()
-    times = [current_time - timedelta(minutes=i) for i in range(100, 0, -1)]
-    
-    sample_data = pd.DataFrame({
-        'timestamp': times,
-        'value': [100 + i * 0.5 + (i % 10) for i in range(100)],
-        'metric_type': ['temperature'] * 100,
-        'sensor_id': ['sensor_1'] * 100
-    })
-    
-    return sample_data
+    return pd.DataFrame(
+        columns=["timestamp", "value", "metric_type", "sensor_id"]
+    )
 
 def consume_kafka_data(config):
-    """
-    STUDENT TODO: Implement actual Kafka consumer
-    """
+    """Read weather records from the Kafka topic for the dashboard."""
     kafka_broker = config.get("kafka_broker", "localhost:9092")
     kafka_topic = config.get("kafka_topic", "streaming-data")
-    
-    # Cache Kafka consumer to avoid recreation
-    cache_key = f"kafka_consumer_{kafka_broker}_{kafka_topic}"
-    if cache_key not in st.session_state:
-        # Connection retry logic for Kafka consumer
-        max_retries = 3
-        retry_delay = 2  # seconds
-        
-        for attempt in range(max_retries):
-            try:
-                st.session_state[cache_key] = KafkaConsumer(
-                    kafka_topic,
-                    bootstrap_servers=[kafka_broker],
-                    auto_offset_reset='latest',
-                    enable_auto_commit=True,
-                    value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-                    consumer_timeout_ms=5000
-                )
-                break  # Success, break out of retry loop
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    st.warning(f"Kafka connection attempt {attempt + 1} failed: {e}. Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                else:
-                    st.error(f"Failed to connect to Kafka after {max_retries} attempts: {e}")
-                    st.session_state[cache_key] = None
-    
-    consumer = st.session_state[cache_key]
-    
-    if consumer:
-        try:
-            # Poll for messages
-            messages = []
-            start_time = time.time()
-            poll_timeout = 5
-            
-            while time.time() - start_time < poll_timeout and len(messages) < 10:
-                msg_pack = consumer.poll(timeout_ms=1000)
-                
-                for tp, messages_batch in msg_pack.items():
-                    for message in messages_batch:
-                        try:
-                            data = message.value
-                            if all(key in data for key in ['timestamp', 'value', 'metric_type', 'sensor_id']):
-                                # Robust timestamp parsing for various ISO 8601 formats
-                                timestamp_str = data['timestamp']
-                                try:
-                                    # Handle common ISO 8601 formats including Zulu time
-                                    if timestamp_str.endswith('Z'):
-                                        timestamp_str = timestamp_str[:-1] + '+00:00'
-                                    # Parse the timestamp
-                                    timestamp = datetime.fromisoformat(timestamp_str)
-                                    messages.append({
-                                        'timestamp': timestamp,
-                                        'value': float(data['value']),
-                                        'metric_type': data['metric_type'],
-                                        'sensor_id': data['sensor_id']
-                                    })
-                                except ValueError as ve:
-                                    st.warning(f"Invalid timestamp format '{timestamp_str}': {ve}")
-                            else:
-                                st.warning(f"Invalid message format: {data}")
-                        except (ValueError, KeyError, TypeError) as e:
-                            st.warning(f"Error processing message: {e}")
-            
-            if messages:
-                return pd.DataFrame(messages)
-            else:
-                st.info("No messages received from Kafka. Using sample data.")
-                return generate_sample_data()
-                
-        except (NoBrokersAvailable, KafkaError, Exception) as e:
-            error_type = "Kafka broker unavailable" if isinstance(e, NoBrokersAvailable) else f"Kafka error: {e}" if isinstance(e, KafkaError) else f"Unexpected error: {e}"
-            st.error(f"{error_type}. Using sample data.")
-            return generate_sample_data()
-    else:
-        st.error("Unable to connect to Kafka. Using sample data.")
-        return generate_sample_data()
+
+    consumer = None
+
+    try:
+        consumer = KafkaConsumer(
+            bootstrap_servers=[kafka_broker],
+            group_id=None,
+            auto_offset_reset="earliest",
+            enable_auto_commit=False,
+            value_deserializer=lambda x: json.loads(x.decode("utf-8")),
+            consumer_timeout_ms=3000,
+        )
+
+        # Subscribe and initialize the topic partition assignment.
+        consumer.subscribe([kafka_topic])
+        consumer.poll(timeout_ms=1000)
+
+        # Read existing records as well as newly arriving records.
+        consumer.seek_to_beginning()
+
+        messages = []
+        start_time = time.time()
+
+        while time.time() - start_time < 5 and len(messages) < 100:
+            batches = consumer.poll(timeout_ms=500)
+
+            for batch in batches.values():
+                for message in batch:
+                    data = message.value
+
+                    if not isinstance(data, dict):
+                        continue
+
+                    required = [
+                        "timestamp", "value", "metric_type", "sensor_id"
+                    ]
+                    if not all(key in data for key in required):
+                        continue
+
+                    try:
+                        timestamp_str = str(data["timestamp"])
+                        if timestamp_str.endswith("Z"):
+                            timestamp_str = timestamp_str[:-1] + "+00:00"
+
+                        timestamp = datetime.fromisoformat(timestamp_str)
+                        if timestamp.tzinfo is not None:
+                            timestamp = timestamp.astimezone().replace(tzinfo=None)
+
+                        messages.append({
+                            "timestamp": timestamp,
+                            "value": float(data["value"]),
+                            "metric_type": data["metric_type"],
+                            "sensor_id": data["sensor_id"],
+                        })
+                    except (ValueError, TypeError):
+                        continue
+
+        if not messages:
+            return pd.DataFrame(
+                columns=["timestamp", "value", "metric_type", "sensor_id"]
+            )
+
+        return (
+            pd.DataFrame(messages)
+            .drop_duplicates()
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+
+    except Exception as e:
+        st.error(f"Kafka consumer error: {e}")
+        return None
+
+    finally:
+        if consumer is not None:
+            consumer.close()
+
+
 
 def query_historical_data(time_range="1h", metrics=None):
     """
-    STUDENT TODO: Implement actual historical data query
-    
-    This function should:
-    1. Connect to HDFS/MongoDB
-    2. Query historical data based on time range and selected metrics
-    3. Return aggregated historical data
-    
-    Parameters:
-    - time_range: time period to query (e.g., "1h", "24h", "7d")
-    - metrics: list of metric types to include
-    
-    Expected return format:
-    pandas DataFrame with historical data
+    Retrieve historical weather records from MongoDB
+    based on the selected time range and metric types.
     """
-    # STUDENT TODO: Replace with actual storage query
-    st.warning("STUDENT TODO: Implement historical data query in query_historical_data() function")
-    
-    # Return sample data for template demonstration
-    return generate_sample_data()
+    from pymongo import MongoClient
+    from pymongo.errors import PyMongoError
+
+    empty_columns = [
+        "timestamp",
+        "value",
+        "metric_type",
+        "sensor_id"
+    ]
+
+    client = None
+
+    try:
+        client = MongoClient(
+            "mongodb://localhost:27017/",
+            serverSelectionTimeoutMS=3000
+        )
+
+        # Check the MongoDB connection
+        client.admin.command("ping")
+
+        # Select the database and collection
+        db = client["weather_dashboard"]
+        collection = db["weather_records"]
+
+        # Set the selected historical time range
+        now = datetime.now().astimezone()
+
+        range_map = {
+            "1h": timedelta(hours=1),
+            "24h": timedelta(hours=24),
+            "7d": timedelta(days=7),
+            "30d": timedelta(days=30)
+        }
+
+        start_time = now - range_map.get(
+            time_range,
+            timedelta(hours=1)
+        )
+
+        query = {
+            "timestamp": {
+                "$gte": start_time
+            }
+        }
+
+        # Filter by selected metric types
+        if metrics and "all" not in metrics:
+            query["metric_type"] = {
+                "$in": metrics
+            }
+
+        # Retrieve records in chronological order
+        records = list(
+            collection.find(
+                query,
+                {"_id": 0}
+            ).sort("timestamp", 1)
+        )
+
+        if not records:
+            return pd.DataFrame(columns=empty_columns)
+
+        df = pd.DataFrame(records)
+
+        # Convert fields to usable data types
+        df["timestamp"] = pd.to_datetime(
+            df["timestamp"],
+            errors="coerce",
+            utc=True
+        )
+
+        df["value"] = pd.to_numeric(
+            df["value"],
+            errors="coerce"
+        )
+
+        df = df.dropna(
+            subset=["timestamp", "value"]
+        )
+
+        return df
+
+    except (PyMongoError, ValueError, TypeError, KeyError) as e:
+        st.error(f"MongoDB historical query failed: {e}")
+        return pd.DataFrame(columns=empty_columns)
+
+    finally:
+        if client is not None:
+            client.close()
+
 
 
 def display_real_time_view(config, refresh_interval):
-    """
-    Page 1: Real-time Streaming View
-    STUDENT TODO: Implement real-time data visualization from Kafka
-    """
+    """Display live weather records consumed from Kafka."""
     st.header("📈 Real-time Streaming Dashboard")
-    
-    # Refresh status
+
     refresh_state = st.session_state.refresh_state
-    st.info(f"**Auto-refresh:** {'🟢 Enabled' if refresh_state['auto_refresh'] else '🔴 Disabled'} - Updates every {refresh_interval} seconds")
-    
-    # Loading indicator for data consumption
+    status = "🟢 Enabled" if refresh_state["auto_refresh"] else "🔴 Disabled"
+    st.info(f"**Auto-refresh:** {status} — updates every {refresh_interval} seconds")
+
     with st.spinner("Fetching real-time data from Kafka..."):
         real_time_data = consume_kafka_data(config)
-    
-    if real_time_data is not None:
-        # Data freshness indicator
-        data_freshness = datetime.now() - refresh_state['last_refresh']
-        freshness_color = "🟢" if data_freshness.total_seconds() < 10 else "🟡" if data_freshness.total_seconds() < 30 else "🔴"
-        
-        st.success(f"{freshness_color} Data updated {data_freshness.total_seconds():.0f} seconds ago")
-        
-        # Real-time data metrics
-        st.subheader("📊 Live Data Metrics")
-        if not real_time_data.empty:
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.metric("Records Received", len(real_time_data))
-            with col2:
-                st.metric("Latest Value", f"{real_time_data['value'].iloc[-1]:.2f}")
-            with col3:
-                st.metric("Data Range", f"{real_time_data['timestamp'].min().strftime('%H:%M')} - {real_time_data['timestamp'].max().strftime('%H:%M')}")
-        
-        # Real-time chart
-        st.subheader("📈 Real-time Trend")
-        
-        if not real_time_data.empty:
-            # STUDENT TODO: Customize this chart for your specific data
-            fig = px.line(
-                real_time_data,
-                x='timestamp',
-                y='value',
-                title=f"Real-time Data Stream (Last {len(real_time_data)} records)",
-                labels={'value': 'Sensor Value', 'timestamp': 'Time'},
-                template='plotly_white'
-            )
-            fig.update_layout(
-                xaxis_title="Time",
-                yaxis_title="Value",
-                hovermode='x unified'
-            )
-            st.plotly_chart(fig, width='stretch')
-            
-            # Raw data table with auto-refresh
-            with st.expander("📋 View Raw Data"):
-                st.dataframe(
-                    real_time_data.sort_values('timestamp', ascending=False),
-                    width='stretch',
-                    height=300
-                )
-        else:
-            st.warning("No real-time data available. STUDENT TODO: Implement Kafka consumer.")
-    
-    else:
-        st.error("STUDENT TODO: Kafka data consumption not implemented")
+
+    if real_time_data is None:
+        st.error(
+            "Could not read from Kafka. Check that Kafka is running and that "
+            "the broker and topic settings in the sidebar are correct."
+        )
+        return
+
+    st.success("Kafka query completed.")
+
+    if real_time_data.empty:
+        st.warning(
+            "No valid weather messages were found in this Kafka topic. "
+            "Run the producer and then refresh the dashboard."
+        )
+        return
+
+    real_time_data = real_time_data.copy()
+    real_time_data["timestamp"] = pd.to_datetime(
+        real_time_data["timestamp"], errors="coerce"
+    )
+    real_time_data["value"] = pd.to_numeric(
+        real_time_data["value"], errors="coerce"
+    )
+    real_time_data = (
+        real_time_data.dropna(subset=["timestamp", "value"])
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+
+    if real_time_data.empty:
+        st.warning("Kafka messages were received, but none had valid timestamps and numeric values.")
+        return
+
+    st.subheader("📊 Live Data Metrics")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Records Received", len(real_time_data))
+    with col2:
+        st.metric("Latest Temperature", f"{real_time_data['value'].iloc[-1]:.2f} °C")
+    with col3:
+        first_time = real_time_data["timestamp"].min().strftime("%H:%M:%S")
+        last_time = real_time_data["timestamp"].max().strftime("%H:%M:%S")
+        st.metric("Data Range", f"{first_time} – {last_time}")
+
+    st.subheader("📈 Real-time Temperature Trend")
+    fig = px.line(
+        real_time_data,
+        x="timestamp",
+        y="value",
+        color="sensor_id" if real_time_data["sensor_id"].nunique() > 1 else None,
+        title=f"WeatherAPI Temperature Readings ({len(real_time_data)} records)",
+        labels={"value": "Temperature (°C)", "timestamp": "Time", "sensor_id": "Source"},
+        markers=True,
+        template="plotly_white",
+    )
+    fig.update_layout(xaxis_title="Time", yaxis_title="Temperature (°C)", hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander("📋 View Raw Kafka Data"):
+        st.dataframe(
+            real_time_data.sort_values("timestamp", ascending=False),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 def display_historical_view(config):
-    """
-    STUDENT TODO: Implement historical data query and visualization
-    """
+    """Display historical weather records from MongoDB."""
     st.header("📊 Historical Data Analysis")
-    
+
+    if config.get("storage_type", "MongoDB") == "HDFS":
+        st.warning(
+            "HDFS is not connected in this project configuration. "
+            "Select MongoDB in the sidebar to view the historical records currently stored by the consumer."
+        )
+        return
+
     with st.expander("ℹ️ Implementation Guide"):
-        st.info("""
-        **STUDENT TODO:** This page should display historical data queried from HDFS or MongoDB.
-        Implement the following:
-        - Connection to your chosen storage system (HDFS/MongoDB)
-        - Interactive filters and selectors for data exploration
-        - Data aggregation and analysis capabilities
-        - Historical trend visualization
-        """)
-    
+        st.write(
+            "Historical weather records are retrieved from MongoDB. "
+            "Use the filters to explore the selected time period "
+            "and view temperature trends."
+        )
+
     # Interactive controls
     st.subheader("Data Filters")
     col1, col2, col3 = st.columns(3)
-    
+
     with col1:
         time_range = st.selectbox(
             "Time Range",
             ["1h", "24h", "7d", "30d"],
-            help="STUDENT TODO: Implement time-based filtering in your query"
+            help="Select the historical time period."
         )
-    
+
     with col2:
         metric_type = st.selectbox(
             "Metric Type",
-            ["temperature", "humidity", "pressure", "all"],
-            help="STUDENT TODO: Implement metric filtering in your query"
+            ["temperature", "humidity", "all"],
+            help="Temperature is stored as value; humidity is a separate field."
         )
-    
+
     with col3:
         aggregation = st.selectbox(
             "Aggregation",
             ["raw", "hourly", "daily", "weekly"],
-            help="STUDENT TODO: Implement data aggregation in your query"
+            help="Choose how to group historical readings."
         )
-    
-    # STUDENT TODO: Replace with actual historical data query
-    historical_data = query_historical_data(time_range, [metric_type] if metric_type != "all" else None)
-    
-    if historical_data is not None:
-        # Display raw data
-        st.subheader("Historical Data Table")
-        st.info("STUDENT TODO: Customize data display for your specific dataset")
-        
-        st.dataframe(
-            historical_data,
-            width='stretch',
-            hide_index=True
+
+    # Retrieve the historical records from MongoDB
+    metrics = (
+        ["temperature"]
+        if metric_type == "temperature"
+        else None
+    )
+
+    historical_data = query_historical_data(time_range, metrics)
+
+    if historical_data is None or historical_data.empty:
+        st.warning(
+            "No historical records were found for this time range. "
+            "Make sure the Kafka-to-MongoDB consumer is running "
+            "and that MongoDB contains recent weather records."
         )
-        
-        # Historical trends
-        st.subheader("Historical Trends")
-        st.info("STUDENT TODO: Implement meaningful historical analysis and visualization")
-        
-        if not historical_data.empty:
-            # STUDENT TODO: Customize this analysis for your data
-            fig = px.line(
-                historical_data,
-                x='timestamp',
-                y='value',
-                title="STUDENT TODO: Customize historical trend analysis"
-            )
-            st.plotly_chart(fig, width='stretch')
-            
-            # Additional analysis
-            st.subheader("Data Summary")
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.metric("Total Records", len(historical_data))
-                st.metric("Date Range", f"{historical_data['timestamp'].min().strftime('%Y-%m-%d')} to {historical_data['timestamp'].max().strftime('%Y-%m-%d')}")
-            
-            with col2:
-                st.metric("Average Value", f"{historical_data['value'].mean():.2f}")
-                st.metric("Data Variability", f"{historical_data['value'].std():.2f}")
-    
+        return
+
+    historical_data = historical_data.copy()
+
+    historical_data["timestamp"] = pd.to_datetime(
+        historical_data["timestamp"],
+        errors="coerce",
+        utc=True
+    )
+    historical_data["value"] = pd.to_numeric(
+        historical_data["value"],
+        errors="coerce"
+    )
+
+    historical_data = historical_data.dropna(
+        subset=["timestamp", "value"]
+    )
+
+    if historical_data.empty:
+        st.warning("No valid numeric weather readings are available.")
+        return
+
+    # Select the metric to display.
+    # The current producer publishes temperature as its value.
+    if metric_type == "humidity":
+        if "humidity" not in historical_data.columns:
+            st.warning("Humidity values are not available in these records.")
+            return
+
+        historical_data["value"] = pd.to_numeric(
+            historical_data["humidity"],
+            errors="coerce"
+        )
+        chart_label = "Humidity (%)"
+
     else:
-        st.error("STUDENT TODO: Historical data query not implemented")
+        historical_data = historical_data[
+            historical_data["metric_type"] == "temperature"
+        ]
+        chart_label = "Temperature (°C)"
+
+    historical_data = historical_data.dropna(
+        subset=["timestamp", "value"]
+    )
+
+    if historical_data.empty:
+        st.warning("No records are available for the selected metric.")
+        return
+
+    # Apply aggregation if selected.
+    chart_data = historical_data.sort_values("timestamp").copy()
+
+    if aggregation != "raw":
+        frequency_map = {
+            "hourly": "h",
+            "daily": "D",
+            "weekly": "W"
+        }
+
+        frequency = frequency_map[aggregation]
+
+        chart_data = (
+            chart_data
+            .set_index("timestamp")
+            .resample(frequency)["value"]
+            .mean()
+            .dropna()
+            .reset_index()
+        )
+
+    # Display the historical records
+    st.subheader("Historical Data Table")
+
+    display_columns = [
+        column for column in [
+            "timestamp",
+            "value",
+            "metric_type",
+            "sensor_id",
+            "location",
+            "condition",
+            "humidity",
+            "wind_kph",
+            "feelslike_c"
+        ]
+        if column in historical_data.columns
+    ]
+
+    st.dataframe(
+        historical_data[display_columns].sort_values(
+            "timestamp",
+            ascending=False
+        ),
+        width="stretch",
+        hide_index=True
+    )
+
+    # Display historical trends
+    st.subheader("Historical Trends")
+
+    if aggregation == "raw":
+        fig = px.line(
+            chart_data,
+            x="timestamp",
+            y="value",
+            title=f"Historical {metric_type.title()} Readings",
+            labels={
+                "timestamp": "Time",
+                "value": chart_label
+            },
+            markers=True,
+            template="plotly_white"
+        )
+    else:
+        fig = px.line(
+            chart_data,
+            x="timestamp",
+            y="value",
+            title=f"{aggregation.title()} Average {metric_type.title()}",
+            labels={
+                "timestamp": "Time",
+                "value": chart_label
+            },
+            markers=True,
+            template="plotly_white"
+        )
+
+    fig.update_layout(hovermode="x unified")
+    st.plotly_chart(fig, width="stretch")
+
+    # Summary statistics
+    st.subheader("Data Summary")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.metric("Total Records", len(historical_data))
+
+    with col2:
+        st.metric(
+            "Average Reading",
+            f"{historical_data['value'].mean():.2f}"
+        )
+
+    with col3:
+        variability = historical_data["value"].std()
+        st.metric(
+            "Standard Deviation",
+            f"{variability:.2f}" if pd.notna(variability) else "N/A"
+        )
+
+    start_date = historical_data["timestamp"].min()
+    end_date = historical_data["timestamp"].max()
+
+    st.caption(
+        f"Data period: {start_date.strftime('%Y-%m-%d %H:%M UTC')} "
+        f"to {end_date.strftime('%Y-%m-%d %H:%M UTC')}"
+    )
 
 def main():
-    """
-    STUDENT TODO: Customize the main application flow as needed
-    """
+    """Configure and run the streaming dashboard."""
     st.title("🚀 Streaming Data Dashboard")
-    
+
     with st.expander("📋 Project Instructions"):
-        st.markdown("""
-        **STUDENT PROJECT TEMPLATE**
-        
-        ### Implementation Required:
-        - **Real-time Data**: Connect to Kafka and process streaming data
-        - **Historical Data**: Query from HDFS/MongoDB
-        - **Visualizations**: Create meaningful charts
-        - **Error Handling**: Implement robust error handling
-        """)
-    
-    # Initialize session state for refresh management
-    if 'refresh_state' not in st.session_state:
+        st.markdown(
+            """
+            **Big Data Streaming Dashboard**
+
+            - **Real-time data:** consume weather messages from Kafka.
+            - **Historical data:** query saved records from MongoDB.
+            - **Visualizations:** explore temperature trends and summary statistics.
+            - **Error handling:** show connection or data-validation messages when a source is unavailable.
+            """
+        )
+
+    if "refresh_state" not in st.session_state:
         st.session_state.refresh_state = {
-            'last_refresh': datetime.now(),
-            'auto_refresh': True
+            "last_refresh": datetime.now(),
+            "auto_refresh": True,
         }
-    
-    # Setup configuration
+
     config = setup_sidebar()
-    
-    # Refresh controls in sidebar
+
     st.sidebar.subheader("Refresh Settings")
-    st.session_state.refresh_state['auto_refresh'] = st.sidebar.checkbox(
+    st.session_state.refresh_state["auto_refresh"] = st.sidebar.checkbox(
         "Enable Auto Refresh",
-        value=st.session_state.refresh_state['auto_refresh'],
-        help="Automatically refresh real-time data"
+        value=st.session_state.refresh_state["auto_refresh"],
+        help="Automatically refresh the dashboard.",
     )
-    
-    if st.session_state.refresh_state['auto_refresh']:
+
+    # Always define the interval, even when auto-refresh is disabled.
+    refresh_interval = 15
+    if st.session_state.refresh_state["auto_refresh"]:
         refresh_interval = st.sidebar.slider(
             "Refresh Interval (seconds)",
             min_value=5,
             max_value=60,
             value=15,
-            help="Set how often real-time data refreshes"
+            help="Set how often the dashboard refreshes.",
         )
-        
-        # Auto-refresh using streamlit-autorefresh package
         st_autorefresh(interval=refresh_interval * 1000, key="auto_refresh")
-    
-    # Manual refresh button
+
     if st.sidebar.button("🔄 Manual Refresh"):
-        st.session_state.refresh_state['last_refresh'] = datetime.now()
         st.rerun()
-    
-    # Display refresh status
+
+    st.session_state.refresh_state["last_refresh"] = datetime.now()
     st.sidebar.markdown("---")
-    st.sidebar.metric("Last Refresh", st.session_state.refresh_state['last_refresh'].strftime("%H:%M:%S"))
-    
-    # Create tabs for different views
+    st.sidebar.metric(
+        "Last Refresh",
+        st.session_state.refresh_state["last_refresh"].strftime("%H:%M:%S"),
+    )
+
     tab1, tab2 = st.tabs(["📈 Real-time Streaming", "📊 Historical Data"])
-    
     with tab1:
         display_real_time_view(config, refresh_interval)
-    
     with tab2:
         display_historical_view(config)
-    
+
 
 if __name__ == "__main__":
     main()

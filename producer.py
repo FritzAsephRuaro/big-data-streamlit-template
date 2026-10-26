@@ -13,12 +13,17 @@ import json
 import time
 import random
 import math
+import os
+import requests
+from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from typing import Dict, Any, List
 
 # Kafka libraries
 from kafka import KafkaProducer
-from kafka.errors import KafkaError, NoBrokersAvailable
+from kafka.errors import KafkaError
+
+load_dotenv()
 
 
 class StreamingDataProducer:
@@ -37,7 +42,11 @@ class StreamingDataProducer:
         """
         self.bootstrap_servers = bootstrap_servers
         self.topic = topic
-        
+
+        self.api_key = os.getenv("WEATHER_API_KEY")
+        self.location = "Quezon City, Philippines"
+        self.api_url = "https://api.weatherapi.com/v1/current.json"   
+
         # Kafka producer configuration
         self.producer_config = {
             'bootstrap_servers': bootstrap_servers,
@@ -80,101 +89,51 @@ class StreamingDataProducer:
         try:
             self.producer = KafkaProducer(**self.producer_config)
             print(f"Kafka producer initialized for {bootstrap_servers} on topic {topic}")
-        except NoBrokersAvailable:
+        except KafkaError:
             print(f"ERROR: No Kafka brokers available at {bootstrap_servers}")
             self.producer = None
         except Exception as e:
             print(f"ERROR: Failed to initialize Kafka producer: {e}")
             self.producer = None
 
+    
     def generate_sample_data(self) -> Dict[str, Any]:
-        """
-        Generate realistic streaming data with stateful patterns
-        
-        This function creates continuously changing records with realistic patterns:
-        - Daily cycles using sine waves
-        - Gradual trends and realistic noise
-        - Multiple metric types (temperature, humidity, pressure)
-        - Temporal consistency with progressive timestamps
-        
-        Expected data format (must include these fields for dashboard compatibility):
-        {
-            "timestamp": "2023-10-01T12:00:00Z",  # ISO format timestamp
-            "value": 123.45,                      # Numeric measurement value
-            "metric_type": "temperature",         # Type of metric (temperature, humidity, etc.)
-            "sensor_id": "sensor_001",            # Unique identifier for data source
-            "location": "server_room_a",          # Sensor location
-            "unit": "celsius",                    # Measurement unit
+        """Fetch current weather data from WeatherAPI."""
+        if not self.api_key:
+            raise ValueError("WEATHER_API_KEY is missing from .env")
+
+        response = requests.get(
+            self.api_url,
+            params={
+                "key": self.api_key,
+                "q": self.location,
+                "aqi": "no",
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+
+        result = response.json()
+        current = result["current"]
+        place = result["location"]
+
+        return {
+            "timestamp": datetime.now().astimezone().isoformat(),
+            "value": float(current["temp_c"]),
+            "metric_type": "temperature",
+            "sensor_id": (
+                "weatherapi_"
+                + place["name"].lower().replace(" ", "_")
+            ),
+            "location": place["name"],
+            "region": place.get("region", ""),
+            "country": place.get("country", ""),
+            "unit": "celsius",
+            "humidity": int(current["humidity"]),
+            "wind_kph": float(current["wind_kph"]),
+            "condition": current["condition"]["text"],
+            "feelslike_c": float(current["feelslike_c"]),
         }
-        """
-        
-        # Select a random sensor from the expanded pool
-        sensor = random.choice(self.sensors)
-        sensor_id = sensor["id"]
-        metric_type = sensor["type"]
-        
-        # Initialize sensor state if not exists
-        if sensor_id not in self.sensor_states:
-            config = self.metric_ranges[metric_type]
-            base_value = random.uniform(config["min"], config["max"])
-            trend = random.uniform(config["trend_range"][0], config["trend_range"][1])
-            phase_offset = random.uniform(0, 2 * 3.14159)  # Random phase for daily cycle
-            
-            self.sensor_states[sensor_id] = {
-                "base_value": base_value,
-                "trend": trend,
-                "phase_offset": phase_offset,
-                "last_value": base_value,
-                "message_count": 0
-            }
-        
-        state = self.sensor_states[sensor_id]
-        
-        # Calculate progressive timestamp with configurable intervals
-        current_time = self.base_time + timedelta(seconds=self.time_counter)
-        self.time_counter += random.uniform(0.5, 2.0)  # Variable intervals for realism
-        
-        # Generate realistic value with patterns
-        config = self.metric_ranges[metric_type]
-        
-        # Daily cycle using sine wave (24-hour period)
-        hours_in_day = 24
-        current_hour = current_time.hour + current_time.minute / 60
-        daily_cycle = math.sin(2 * 3.14159 * current_hour / hours_in_day + state["phase_offset"])
-        
-        # Apply trend over time (slow drift)
-        trend_effect = state["trend"] * (state["message_count"] / 100.0)
-        
-        # Add realistic noise (small random variations)
-        noise = random.uniform(-config["daily_amplitude"] * 0.1, config["daily_amplitude"] * 0.1)
-        
-        # Calculate final value with bounds checking
-        base_value = state["base_value"]
-        daily_variation = daily_cycle * config["daily_amplitude"]
-        raw_value = base_value + daily_variation + trend_effect + noise
-        
-        # Ensure value stays within reasonable bounds
-        bounded_value = max(config["min"], min(config["max"], raw_value))
-        
-        # Update state
-        state["last_value"] = bounded_value
-        state["message_count"] += 1
-        
-        # Occasionally introduce small trend changes for realism
-        if random.random() < 0.01:  # 1% chance per message
-            state["trend"] = random.uniform(config["trend_range"][0], config["trend_range"][1])
-        
-        # Generate realistic data structure
-        sample_data = {
-            "timestamp": current_time.isoformat() + 'Z',
-            "value": round(bounded_value, 2),
-            "metric_type": metric_type,
-            "sensor_id": sensor_id,
-            "location": sensor["location"],
-            "unit": sensor["unit"],
-        }
-        
-        return sample_data
 
     def serialize_data(self, data: Dict[str, Any]) -> bytes:
         """
@@ -316,8 +275,8 @@ def parse_arguments():
     parser.add_argument(
         '--rate',
         type=float,
-        default=0.1,
-        help='Messages per second (default: 0.1 for 10-second intervals)'
+        default=1 / 15,
+        help='Messages per second (default: one message every 15 seconds)'
     )
     
     parser.add_argument(
